@@ -1,13 +1,17 @@
 from flask import Blueprint, request, jsonify, Response
-from flask_cors import CORS  # Import CORS
+from flask_cors import CORS  
 from utils.github import check_repo_file
-from config import TOKEN_FILE_PATH, UPLOAD_FOLDER
+from utils.bootstrapState import create_bootstrap_state,update_bootstrap_state
+from config import TOKEN_FILE_PATH, UPLOAD_FOLDER, TOKEN_FILE_PATH_BACKEND
 import os
 import json
+import queue
 from werkzeug.utils import secure_filename
 
 bootstrap_bp = Blueprint('bootstrap', __name__)
 CORS(bootstrap_bp, resources={r"/*": {"origins": "*"}})  
+
+update_queue = queue.Queue()
 
 @bootstrap_bp.route('/bootstrap', methods=['POST'])
 def bootstrap():
@@ -18,14 +22,18 @@ def bootstrap():
             return jsonify({"error": "No data received"}), 400
 
         github_access_token = data.pop('githubAccessToken', None)
+        github_access_token_for_backend = data.pop('githubAccessTokenForBackend', None)
 
-        if not github_access_token:
+        if not github_access_token and not github_access_token_for_backend:
             return jsonify({"error": "GitHub access token is required"}), 400
 
         with open(TOKEN_FILE_PATH, 'w') as f:
             f.write(github_access_token)
+        with open(TOKEN_FILE_PATH_BACKEND, 'w') as f:
+            f.write(github_access_token_for_backend)
 
         os.chmod(TOKEN_FILE_PATH, 0o600)
+        os.chmod(TOKEN_FILE_PATH_BACKEND, 0o600)
 
         filename = secure_filename("bootstrap_data.json")
         file_path = os.path.join(UPLOAD_FOLDER, filename)
@@ -40,18 +48,27 @@ def bootstrap():
             return jsonify({"error": "gitOrgName or bootstrapRepo missing in data"}), 400
 
         file_to_check = "envs/shared/terraform.tfvars"
-        if check_repo_file(github_access_token, git_org_name, bootstrap_repo, file_to_check):
-            return jsonify({
-                "status": "success",
-                "message": "File already exists in the repository!"
-            }), 200
+
+        update_queue.put("Checking the repository...\n\n")
+
+        file_exists = check_repo_file(github_access_token_for_backend, git_org_name, bootstrap_repo, file_to_check)
+
+        if file_exists:
+            message = "Repository already initialized. Checking for changes"
+            update_queue.put(f"{message}\n\n")
+            update_bootstrap_state(update_queue,github_access_token_for_backend,git_org_name,bootstrap_repo,github_access_token)
         else:
-            return jsonify({
-                "status": "success",
-                "message": "Repository is empty or file does not exist!"
-            }), 200
+            message = "Repository is empty. Initializing the Repositories"
+            update_queue.put(f"{message}\n\n")
+            create_bootstrap_state(update_queue)
+
+        return jsonify({
+            "status": "success",
+            "message": message
+        }), 200
 
     except Exception as e:
+        update_queue.put(f"Error: {str(e)}\n\n")
         return jsonify({
             "status": "error",
             "message": str(e)
@@ -60,21 +77,11 @@ def bootstrap():
 @bootstrap_bp.route('/bootstrap-stream')
 def bootstrap_stream():
     def generate():
-        try:
-            yield "data: Data received successfully!\n\n"
-
-            import time
-            time.sleep(2)
-
-            yield "data: Data saved successfully!\n\n"
-
-            time.sleep(2)
-            yield "data: Repository checked successfully!\n\n"
-
-            time.sleep(2)
-            yield "data: Process completed successfully!\n\n"
-
-        except Exception as e:
-            yield f"data: Error: {str(e)}\n\n"
+        while True:
+            try:
+                message = update_queue.get(timeout=10)  
+                yield f"data: {message}\n\n"
+            except queue.Empty:
+                break  
 
     return Response(generate(), mimetype='text/event-stream')
