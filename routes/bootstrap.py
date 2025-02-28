@@ -1,7 +1,7 @@
-from flask import Blueprint, request, jsonify, Response
+from flask import Blueprint, request, jsonify, Response, send_file
 from flask_cors import CORS  
 from utils.github import check_repo_file
-from utils.bootstrapState import create_bootstrap_state,update_bootstrap_state
+from utils.bootstrapState import create_bootstrap_state, update_bootstrap_state
 from config import TOKEN_FILE_PATH, UPLOAD_FOLDER, TOKEN_FILE_PATH_BACKEND
 import os
 import json
@@ -60,7 +60,7 @@ def bootstrap():
         else:
             message = "Repository is empty. Initializing the Repositories"
             update_queue.put(f"{message}\n\n")
-            create_bootstrap_state(update_queue)
+            create_bootstrap_state(github_access_token_for_backend,git_org_name,update_queue,bootstrap_repo,github_access_token)
 
         return jsonify({
             "status": "success",
@@ -79,9 +79,30 @@ def bootstrap_stream():
     def generate():
         while True:
             try:
-                message = update_queue.get(timeout=10)  
+                message = update_queue.get(timeout=100)  
                 yield f"data: {message}\n\n"
             except queue.Empty:
                 break  
 
     return Response(generate(), mimetype='text/event-stream')
+
+
+@bootstrap_bp.route('/bootstrap/downloadplan', methods=['GET', 'OPTIONS'])
+def download_plan():
+    try:
+        plan_file_path = os.path.join(UPLOAD_FOLDER, 'plan.json')  
+
+        if not os.path.exists(plan_file_path):
+            return jsonify({"error": "Plan file not found"}), 404
+
+        return send_file(
+            plan_file_path,
+            as_attachment=True,  
+            download_name="bootstrap_plan.json"  
+        )
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500

@@ -1,5 +1,6 @@
 import requests
 import subprocess
+import os
 
 def check_repo_file(github_access_token, git_org_name, bootstrap_repo, file_path):
     url = f"https://api.github.com/repos/{git_org_name}/{bootstrap_repo}/contents/{file_path}"
@@ -17,8 +18,32 @@ def check_repo_file(github_access_token, git_org_name, bootstrap_repo, file_path
 
     return response.status_code==200
 
+
+def clone_repo(update_queue, repo_url):
+    repo_name = repo_url.split("/")[-1].replace(".git", "") 
+    local_path = os.path.join("lz_repos", repo_name) 
+    if os.path.exists(local_path):
+        update_queue.put(f"Removing existing repository at {local_path}...\n\n")
+        subprocess.run(["rm", "-rf", local_path], capture_output=True, text=True)
+        update_queue.put(f"Repository at {local_path} removed.\n\n")
+
+    update_queue.put(f"Cloning repository from {repo_url} to {local_path}...\n\n")
+    result = subprocess.run(["git", "clone", repo_url, local_path], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        if "repository is empty" in result.stderr or "does not appear to be a git repository" in result.stderr:
+            update_queue.put(f"Warning: The repository {repo_url} is empty. Creating an empty folder instead.\n\n")
+            os.makedirs(local_path, exist_ok=True)  
+            return f"Warning: Repository {repo_name} is empty. Created an empty folder."
+        update_queue.put(f"Error cloning repository: {result.stderr}\n\n")
+        return "Error: Failed to clone repository."
+
+    update_queue.put(f"Successfully Cloned: {repo_url}\n\n")
+    update_queue.put("Analyzing the repo...\n\n")
+    return "Success"
+
+
 def push_to_plan_branch(update_queue):
-            # Checkout the `plan` branch (create it if it doesn't exist)
         update_queue.put("Checking out or creating the 'plan' branch...\n\n")
         subprocess.run(
             ["git", "checkout", "-b", "plan"],

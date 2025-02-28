@@ -1,40 +1,19 @@
 import os
 import subprocess
 import json
-from utils.github import push_to_plan_branch
+import shutil
+from utils.github import push_to_plan_branch,clone_repo
+from utils.copy import copy_folder_contents
+from config import UPLOAD_FOLDER
 
 def update_bootstrap_state(update_queue, github_access_token_for_backend, git_org_name, bootstrap_repo,github_access_token):
     try:
+        main_dir = os.getcwd()
         update_queue.put("Infrastructure already exists. Checking for changes...\n\n")
-
-        repo_url = f"https://{github_access_token_for_backend}@github.com/{git_org_name}/{bootstrap_repo}.git"
-        local_path = os.path.join("lz_repos", bootstrap_repo)
-
+        bootstrap_repo_url = f"https://{github_access_token_for_backend}@github.com/{git_org_name}/{bootstrap_repo}.git"
         os.makedirs("lz_repos", exist_ok=True)
-
-        if os.path.exists(local_path):
-            update_queue.put(f"Removing existing repository at {local_path}...\n\n")
-            subprocess.run(
-                ["rm", "-rf", local_path],
-                capture_output=True,
-                text=True
-            )
-            update_queue.put(f"Repository at {local_path} removed.\n\n")
-
-        update_queue.put(f"Cloning repository from {repo_url} to {local_path}...\n\n")
-        result = subprocess.run(
-            ["git", "clone", repo_url, local_path],
-            capture_output=True,
-            text=True
-        )
-
-        if result.returncode != 0:
-            update_queue.put(f"Error cloning repository: {result.stderr}\n\n")
-            return "Error: Failed to clone repository."
-
-        update_queue.put("Repository cloned successfully.\n\n")
-        update_queue.put("Analyzing the bootstrap repo...\n\n")
-
+        local_path = os.path.join("lz_repos",bootstrap_repo_url)
+        clone_repo(update_queue,bootstrap_repo_url)
         update_bootstrap_vars(update_queue,bootstrap_repo)
 
         os.environ["TF_VAR_gh_token"] = github_access_token
@@ -43,15 +22,124 @@ def update_bootstrap_state(update_queue, github_access_token_for_backend, git_or
 
         push_to_plan_branch(update_queue)
 
+        os.chdir(main_dir)
+
+
         return "Bootstrap state updated successfully."
 
     except Exception as e:
         update_queue.put(f"Error updating bootstrap state: {str(e)}\n\n")
         return f"Error: {str(e)}"
     
-def create_bootstrap_state(update_queue):
-    update_queue.put("Creating bootstrap module")
-    return 'creating bootstrap state'
+def create_bootstrap_state(github_access_token_for_backend, git_org_name, update_queue, bootstrap_repo,github_access_token):
+    
+    update_queue.put("Creating bootstrap module\n\n")
+    target_dir = "lz_repos"
+    main_dir = os.getcwd()
+    uploads_dir = os.path.join(main_dir,UPLOAD_FOLDER)
+    os.makedirs(target_dir, exist_ok=True)
+
+    base_repo_url = 'https://github.com/kubeshot/gcp-0-bootstrap-repo.git'
+    clone_repo(update_queue,base_repo_url)
+
+    base_repo = 'gcp-0-bootstrap-repo'
+    update_bootstrap_vars(update_queue,base_repo)
+
+    os.environ["TF_VAR_gh_token"] = github_access_token
+
+    bootstrap_repo_path = os.path.join(target_dir, bootstrap_repo)
+    if os.path.exists(bootstrap_repo_path):
+        shutil.rmtree(bootstrap_repo_path)
+
+    os.makedirs(bootstrap_repo_path, exist_ok=True)
+    update_queue.put(f"Created directory: {bootstrap_repo_path}\n\n")
+
+    os.chdir(bootstrap_repo_path)
+    update_queue.put(f"Changed directory to {bootstrap_repo_path}\n\n")
+
+    subprocess.run(["git", "init"], capture_output=True, text=True)
+    update_queue.put("Initialized empty Git repository\n\n")
+
+    bootstrap_repo_url = f"https://{github_access_token_for_backend}@github.com/{git_org_name}/{bootstrap_repo}.git"
+    subprocess.run(["git", "remote", "add", "origin", bootstrap_repo_url], capture_output=True, text=True)
+    update_queue.put(f"Added remote origin to {bootstrap_repo} repo\n\n")
+
+    subprocess.run(["git", "branch", "-M", "main"], capture_output=True, text=True)
+    subprocess.run(["git", "push", "--set-upstream", "origin", "main"], capture_output=True, text=True)
+    update_queue.put("Pushed empty commit to main branch\n\n")
+
+    subprocess.run(["git", "checkout", "-b", "production"], capture_output=True, text=True)
+    subprocess.run(["git", "push", "--set-upstream", "origin", "production"], capture_output=True, text=True)
+    update_queue.put("Created and pushed production branch\n\n")
+
+    subprocess.run(["git", "checkout", "-b", "plan"], capture_output=True, text=True)
+    update_queue.put("Created plan branch\n\n")
+
+    os.chdir(main_dir)
+    update_queue.put(f'changed to {main_dir} \n\n')
+
+    src_path = os.path.join(target_dir,base_repo)
+    dest_path = os.path.join(bootstrap_repo_path)
+    copy_folder_contents(src_path,dest_path,update_queue)
+
+    terraform_dir = os.path.join(bootstrap_repo_path,"envs","shared")
+    update_queue.put(f'{terraform_dir} is current dir')
+    os.chdir(terraform_dir)
+    update_queue.put(f'Terraform init ...')
+
+    try:
+        result = subprocess.run(["terraform", "init"], capture_output=True, text=True)
+        update_queue.put(f"Terraform init output:\n{result.stdout}")
+        print(f"Terraform init output:\n{result.stdout}")
+
+        update_queue.put("Terraform init Done")
+        
+    except subprocess.CalledProcessError as e:
+        update_queue.put(f"Terraform init failed: {e.stderr}")
+        print(f"Terraform init failed: {e.stderr}")
+
+    plan_output_file = os.path.join("plan.out")
+    json_output_file = os.path.join(uploads_dir, "plan.json")
+    if not os.path.exists(json_output_file):
+        with open(json_output_file, "w") as f:
+            json.dump({}, f)
+
+    update_queue.put("Generating Plan ...")
+    try:
+        plan_process = subprocess.run(
+            ["terraform", "plan", f"-out={plan_output_file}", f"-var=gh_token={github_access_token}"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        update_queue.put("Terraform Plan Generated Successfully.")
+    except subprocess.CalledProcessError as e:
+        update_queue.put(f"Terraform Plan Failed: {e.stderr}")  
+        print(f"Terraform Plan Failed: {e.stderr}")
+        raise  
+
+    try:
+        with open(json_output_file, "w") as json_file:
+            subprocess.run(
+                ["terraform", "show", "-json", plan_output_file],
+                check=True,
+                stdout=json_file,  
+                stderr=subprocess.PIPE, 
+                text=True 
+            )
+        update_queue.put("Terraform Plan Converted to JSON Successfully.")
+    except subprocess.CalledProcessError as e:
+        update_queue.put(f"Terraform Show Failed: {e.stderr}")
+        print(f"Terraform Show Failed: {e.stderr}")
+        raise
+
+    update_queue.put("Plan has been generated")
+    os.chdir(main_dir)
+
+
+    return "Bootstrap state creation complete."
+
+
 
 def update_bootstrap_vars(update_queue, bootstrap_repo):
     try:
@@ -130,8 +218,88 @@ def update_bootstrap_vars(update_queue, bootstrap_repo):
             f.writelines(updated_content)
 
         update_queue.put("Terraform variables updated successfully.\n\n")
-        return "Terraform variables updated successfully."
 
     except Exception as e:
         update_queue.put(f"Error updating terraform variables: {str(e)}\n\n")
         return f"Error: {str(e)}"
+
+    try:
+        file_path = os.path.join("lz_repos", bootstrap_repo, "envs", "shared", "github.tf")
+        if not os.path.exists(file_path):
+            update_queue.put(f"File {file_path} does not exist.\n\n")
+            return "Error: File not found."
+
+        with open(file_path, "r") as f:
+            lines = f.readlines()
+
+        updated_lines = []
+        for line in lines:
+            if 'attribute_condition = "assertion.repository_owner ==' in line:
+                updated_line = line.replace("/GIT ORG NAME/", git_org_name)
+                update_queue.put(f"Updated line: {line.strip()} -> {updated_line.strip()}\n\n")
+                updated_lines.append(updated_line)
+            else:
+                updated_lines.append(line)
+
+        with open(file_path, "w") as f:
+            f.writelines(updated_lines)
+
+        update_queue.put("Updated github.tf successfully.\n\n")
+    except Exception as e:
+        update_queue.put(f"Error updating github.tf: {str(e)}\n\n")
+        return f"Error: {str(e)}"
+    
+    try:
+        provider_tf_path = os.path.join("lz_repos", bootstrap_repo, "envs", "shared", "provider.tf")
+        service_account_path = os.path.join('/app', 'uploads', 'sa_key.json')
+        bootstrap_data_path = os.path.join('/app','uploads','bootstrap_data.json')
+        def get_project_id():
+            try:
+                with open(bootstrap_data_path, 'r') as f:
+                    data = json.load(f)
+                    project_id = data.get('billingProject')
+                    
+                    if project_id:
+                        return project_id
+                    else:
+                        raise KeyError("billingProject  not found in the JSON file.")
+            
+            except FileNotFoundError:
+                print(f"Error: The file {bootstrap_data_path} was not found.")
+            except json.JSONDecodeError:
+                print("Error: Failed to decode the JSON file.")
+            except KeyError as e:
+                print(e)
+
+        project_id = get_project_id()
+        provider_tf_content = f"""
+            provider "google" {{
+            credentials = "{service_account_path}"  
+            project     = "{project_id}"            
+            region      = "northamerica-northeast1"                
+            }}
+
+            provider "google-beta" {{
+            credentials = "{service_account_path}"  
+            project     = "{project_id}"           
+            region      = "northamerica-northeast1"              
+            }}
+            """
+        
+        if os.path.exists(provider_tf_path):
+            # Open the provider.tf file and write the new content
+            with open(provider_tf_path, 'w') as f:
+                f.write(provider_tf_content)
+            update_queue.put(f'provider block updated')
+        else:
+            # If the file doesn't exist, create and write the content
+            with open(provider_tf_path, 'w') as f:
+                f.write(provider_tf_content)
+            update_queue.put(f'provider block failed to update')
+
+
+    except Exception as e:
+        update_queue.put(f"Error updating provider.tf: {str(e)}\n\n")
+        return f"Error: {str(e)}"
+    
+    return "Terraform variables updated successfully."
