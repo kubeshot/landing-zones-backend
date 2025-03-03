@@ -93,7 +93,7 @@ def bootstrap_stream():
     def generate():
         while True:
             try:
-                message = update_queue.get(timeout=100)  
+                message = update_queue.get(timeout=10000)  
                 yield f"data: {message}\n\n"
             except queue.Empty:
                 break  
