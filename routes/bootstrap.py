@@ -7,6 +7,7 @@ import os
 import json
 import queue
 from werkzeug.utils import secure_filename
+from utils.bootstrapState import apply_and_migrate_bootstrap_state
 
 bootstrap_bp = Blueprint('bootstrap', __name__)
 CORS(bootstrap_bp, resources={r"/*": {"origins": "*"}})  
@@ -15,6 +16,7 @@ update_queue = queue.Queue()
 
 @bootstrap_bp.route('/bootstrap', methods=['POST'])
 def bootstrap():
+    os.chdir('/app')
     try:
         data = request.get_json()
 
@@ -73,6 +75,18 @@ def bootstrap():
             "status": "error",
             "message": str(e)
         }), 500
+    
+@bootstrap_bp.route('/bootstrap/apply', methods=['POST'])
+def bootstrap_apply_route():
+    os.chdir('/app')
+    try:
+        update_queue.put("Starting bootstrap apply process...\n\n")
+        apply_and_migrate_bootstrap_state(update_queue)
+
+        return jsonify({"status": "success", "message": "Bootstrap apply initiated."}), 200
+    except Exception as e:
+        update_queue.put(f"Error: {str(e)}\n\n")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @bootstrap_bp.route('/bootstrap-stream')
 def bootstrap_stream():
@@ -89,6 +103,7 @@ def bootstrap_stream():
 
 @bootstrap_bp.route('/bootstrap/downloadplan', methods=['GET', 'OPTIONS'])
 def download_plan():
+    os.chdir('/app')
     try:
         plan_file_path = os.path.join(UPLOAD_FOLDER, 'plan.json')  
 

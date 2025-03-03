@@ -88,3 +88,18 @@ def push_to_plan_branch(update_queue):
             return "Error: Failed to push changes to the 'plan' branch."
 
         update_queue.put("Changes pushed to the 'plan' branch successfully.\n\n")
+        update_queue.put("Creating a pull request from 'plan' to 'production'...\n\n")
+
+        pr_result = subprocess.run(
+            ["gh", "pr", "create", "--base", "production", "--head", "plan", "--title", "Generate Plan", "--body", "Automated PR to merge changes from plan to production"],
+            capture_output=True,
+            text=True
+        )
+
+        if pr_result.returncode != 0:
+            update_queue.put(f"Error creating pull request: {pr_result.stderr}\n\n")
+            return "Error: Failed to create pull request."
+
+        update_queue.put("Pull request created successfully.\n\n")
+
+        return 'ok'

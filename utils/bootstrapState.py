@@ -1,10 +1,17 @@
 import os
+import re
 import subprocess
 import json
 import shutil
 from utils.github import push_to_plan_branch,clone_repo
 from utils.copy import copy_folder_contents
 from config import UPLOAD_FOLDER
+from flask import jsonify
+
+def strip_ansi_escape_codes(text):
+    """Remove ANSI escape codes from a string."""
+    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    return ansi_escape.sub("", text)
 
 def update_bootstrap_state(update_queue, github_access_token_for_backend, git_org_name, bootstrap_repo,github_access_token):
     try:
@@ -114,9 +121,17 @@ def create_bootstrap_state(github_access_token_for_backend, git_org_name, update
         )
         update_queue.put("Terraform Plan Generated Successfully.")
     except subprocess.CalledProcessError as e:
-        update_queue.put(f"Terraform Plan Failed: {e.stderr}")  
-        print(f"Terraform Plan Failed: {e.stderr}")
-        raise  
+        stderr_cleaned = strip_ansi_escape_codes(e.stderr)
+        stdout_cleaned = strip_ansi_escape_codes(e.stdout)
+        
+        error_message = f"Terraform Plan Failed:\nSTDOUT:\n{stdout_cleaned}\n\nSTDERR:\n{stderr_cleaned}"
+        
+        update_queue.put(f"Terraform Plan failed: STDERR:{stderr_cleaned} STDOUT:{stdout_cleaned}")
+        
+        print(error_message)
+        
+        raise Exception(error_message) from e
+    
 
     try:
         with open(json_output_file, "w") as json_file:
@@ -139,7 +154,151 @@ def create_bootstrap_state(github_access_token_for_backend, git_org_name, update
 
     return "Bootstrap state creation complete."
 
+def apply_and_migrate_bootstrap_state(update_queue):
+    update_queue.put('terraform apply .... This may take a while, Please wait')
+    bootstrap_data_path = "/app/uploads/bootstrap_data.json"
+    gh_token_path = "/app/uploads/gh_token.txt"
 
+    try:
+        with open(bootstrap_data_path, "r") as bootstrap_file:
+            bootstrap_data = json.load(bootstrap_file)
+            bootstrap_repo = bootstrap_data.get("bootstrapRepo")
+            if not bootstrap_repo:
+                raise ValueError("bootstrapRepo not found in bootstrap_data.json")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File not found: {bootstrap_data_path}")
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON in file: {bootstrap_data_path}")  
+    
+    try:
+        with open(gh_token_path, "r") as gh_token_file:
+            github_access_token = gh_token_file.read().strip()
+            if not github_access_token:
+                raise ValueError("GitHub token is empty in gh_token.txt")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File not found: {gh_token_path}")
+    
+    terraform_main_path = f"/app/lz_repos/{bootstrap_repo}/envs/shared"
+    app_path = f"/app"
+    if not os.path.exists('/app/stateFile'):
+        os.makedirs('/app/stateFile')
+
+    if os.path.exists(os.path.join(app_path,'stateFile','terraform.tfstate')):
+        update_queue.put(f"State file already exists... Continuing the apply process from last endpoint")        
+        shutil.copy(os.path.join(app_path,'stateFile','terraform.tfstate'), terraform_main_path)
+
+    os.chdir(terraform_main_path)
+    try:
+        apply_process = subprocess.run(
+            ["terraform", "destroy", '-auto-approve',f"-var=gh_token={github_access_token}"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        update_queue.put("Terraform Apply Successful.")
+
+        output_process = subprocess.run(
+            ["terraform", "output", "-json"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        
+        with open("outputs.json", "w") as f:
+            f.write(output_process.stdout)
+
+        shutil.copy("outputs.json", "/app/stateFile/outputs.json")
+        update_queue.put("Terraform output saved and copied to /app/stateFile.")
+    except subprocess.CalledProcessError as e:
+        stderr_cleaned = strip_ansi_escape_codes(e.stderr)
+        stdout_cleaned = strip_ansi_escape_codes(e.stdout)
+        
+        error_message = f"Terraform Apply Failed:\nSTDOUT:\n{stdout_cleaned}\n\nSTDERR:\n{stderr_cleaned}"
+        
+        update_queue.put(f"Terraform Apply failed: STDERR:{stderr_cleaned} STDOUT:{stdout_cleaned}")
+        
+        print(error_message)
+        
+        raise Exception(error_message) from e
+    
+    source_file = "terraform.tfstate"  
+    destination_dir = "/app/stateFile"  
+    try:
+        shutil.copy(source_file, destination_dir)
+        update_queue.put(f"File '{source_file}' copied to '{destination_dir}' successfully.")
+    except Exception as e:
+        error_message = f"Failed to copy '{source_file}' to '{destination_dir}': {str(e)}"
+        update_queue.put(error_message)
+        raise Exception(error_message) from e
+    
+    json_file_path = '/app/stateFile/outputs.json'
+    tf_file_path = os.path.join(terraform_main_path,'backend.tf')
+    gcs_bucket = '/REPLACE/' 
+    try:
+        if os.path.exists(json_file_path):
+            with open(json_file_path, 'r') as f:
+                data = json.load(f)
+            
+            if 'gcs_bucket_tfstate' in data:
+                gcs_bucket_tfstate = data['gcs_bucket_tfstate']
+                if isinstance(gcs_bucket_tfstate, dict) and 'value' in gcs_bucket_tfstate:
+                    gcs_bucket = gcs_bucket_tfstate['value']
+                else:
+                    update_queue.put("'gcs_bucket_tfstate' key exists in outputs.json but does not contain a valid value.")
+            else:
+                update_queue.put("'gcs_bucket_tfstate' key not found in outputs.json. Using default value.")
+        else:
+            update_queue.put(f"File not found: {json_file_path}. Using default value.")
+
+        new_backend_config = f""" terraform {{
+        backend "gcs" {{
+            bucket = "{gcs_bucket}"
+            prefix = "terraform/bootstrap/state"
+        }}
+    }}"""
+
+        with open(tf_file_path, 'w') as f:
+            f.write(new_backend_config)
+        
+        update_queue.put(f"backend.tf updated with GCS bucket: {gcs_bucket}")
+
+    except Exception as e:
+        update_queue.put(f"Error: {e}")
+        raise Exception from e
+
+    update_queue.put('Migrating the state to backend')
+    try:
+        init_process = subprocess.run(
+            ["terraform", "init", "-migrate-state"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        update_queue.put("Terraform Init - Migrate Successful.")
+        
+    except subprocess.CalledProcessError as e:
+        stderr_cleaned = strip_ansi_escape_codes(e.stderr)
+        stdout_cleaned = strip_ansi_escape_codes(e.stdout)
+        
+        error_message = f"Terraform Init - Migrate Failed:\nSTDOUT:\n{stdout_cleaned}\n\nSTDERR:\n{stderr_cleaned}"
+        
+        update_queue.put(f"Terraform Init - Migrate failed: STDERR:{stderr_cleaned} STDOUT:{stdout_cleaned}")
+        
+        print(error_message)
+        
+        raise Exception(error_message) from e
+    
+
+    os.chdir(app_path)
+    local_path = os.path.join('/app','lz_repos',bootstrap_repo)
+    os.chdir(local_path)
+    update_queue.put(f"Changed directory to {local_path}.\n\n")
+
+    push_to_plan_branch(update_queue)
+
+    os.chdir(app_path)
+    
+    return 'ok'
 
 def update_bootstrap_vars(update_queue, bootstrap_repo):
     try:
@@ -287,12 +446,10 @@ def update_bootstrap_vars(update_queue, bootstrap_repo):
             """
         
         if os.path.exists(provider_tf_path):
-            # Open the provider.tf file and write the new content
             with open(provider_tf_path, 'w') as f:
                 f.write(provider_tf_content)
             update_queue.put(f'provider block updated')
         else:
-            # If the file doesn't exist, create and write the content
             with open(provider_tf_path, 'w') as f:
                 f.write(provider_tf_content)
             update_queue.put(f'provider block failed to update')
