@@ -293,8 +293,8 @@ def apply_and_migrate_bootstrap_state(update_queue):
     local_path = os.path.join('/app','lz_repos',bootstrap_repo)
     os.chdir(local_path)
     update_queue.put(f"Changed directory to {local_path}.\n\n")
-
-    push_to_plan_branch(update_queue)
+    update_queue.put(f"pushing to paln branch")
+    # push_to_plan_branch(update_queue)
 
     os.chdir(app_path)
     
