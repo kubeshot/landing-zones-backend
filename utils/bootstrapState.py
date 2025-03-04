@@ -190,13 +190,26 @@ def apply_and_migrate_bootstrap_state(update_queue):
     os.chdir(terraform_main_path)
     try:
         apply_process = subprocess.run(
-            ["terraform", "destroy", '-auto-approve',f"-var=gh_token={github_access_token}"],
+            ["terraform", "apply", '-auto-approve',f"-var=gh_token={github_access_token}"],
             check=True,
             capture_output=True,
             text=True
         )
         update_queue.put("Terraform Apply Successful.")
 
+
+    except subprocess.CalledProcessError as e:
+        stderr_cleaned = strip_ansi_escape_codes(e.stderr)
+        stdout_cleaned = strip_ansi_escape_codes(e.stdout)
+        
+        error_message = f"Terraform Apply Failed:\nSTDOUT:\n{stdout_cleaned}\n\nSTDERR:\n{stderr_cleaned}"
+        
+        update_queue.put(f"Terraform Apply failed: STDERR:{stderr_cleaned} STDOUT:{stdout_cleaned}")
+        
+        print(error_message)
+        
+        raise Exception(error_message) from e
+    finally:
         output_process = subprocess.run(
             ["terraform", "output", "-json"],
             check=True,
@@ -209,27 +222,11 @@ def apply_and_migrate_bootstrap_state(update_queue):
 
         shutil.copy("outputs.json", "/app/stateFile/outputs.json")
         update_queue.put("Terraform output saved and copied to /app/stateFile.")
-    except subprocess.CalledProcessError as e:
-        stderr_cleaned = strip_ansi_escape_codes(e.stderr)
-        stdout_cleaned = strip_ansi_escape_codes(e.stdout)
-        
-        error_message = f"Terraform Apply Failed:\nSTDOUT:\n{stdout_cleaned}\n\nSTDERR:\n{stderr_cleaned}"
-        
-        update_queue.put(f"Terraform Apply failed: STDERR:{stderr_cleaned} STDOUT:{stdout_cleaned}")
-        
-        print(error_message)
-        
-        raise Exception(error_message) from e
-    
-    source_file = "terraform.tfstate"  
-    destination_dir = "/app/stateFile"  
-    try:
+        source_file = "terraform.tfstate"  
+        destination_dir = "/app/stateFile"
         shutil.copy(source_file, destination_dir)
         update_queue.put(f"File '{source_file}' copied to '{destination_dir}' successfully.")
-    except Exception as e:
-        error_message = f"Failed to copy '{source_file}' to '{destination_dir}': {str(e)}"
-        update_queue.put(error_message)
-        raise Exception(error_message) from e
+
     
     json_file_path = '/app/stateFile/outputs.json'
     tf_file_path = os.path.join(terraform_main_path,'backend.tf')
@@ -294,7 +291,7 @@ def apply_and_migrate_bootstrap_state(update_queue):
     os.chdir(local_path)
     update_queue.put(f"Changed directory to {local_path}.\n\n")
     update_queue.put(f"pushing to paln branch")
-    # push_to_plan_branch(update_queue)
+    push_to_plan_branch(update_queue)
 
     os.chdir(app_path)
     

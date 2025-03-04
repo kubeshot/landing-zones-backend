@@ -8,6 +8,7 @@ import json
 import queue
 from werkzeug.utils import secure_filename
 from utils.bootstrapState import apply_and_migrate_bootstrap_state
+from utils.terraformDestroy import terraform_destroy_bootstrap
 
 bootstrap_bp = Blueprint('bootstrap', __name__)
 CORS(bootstrap_bp, resources={r"/*": {"origins": "*"}})  
@@ -42,6 +43,7 @@ def bootstrap():
 
         with open(file_path, 'w') as f:
             json.dump(data, f, indent=4)
+
 
         git_org_name = data.get('gitOrgName')
         bootstrap_repo = data.get('bootstrapRepo')
@@ -84,6 +86,51 @@ def bootstrap_apply_route():
         apply_and_migrate_bootstrap_state(update_queue)
 
         return jsonify({"status": "success", "message": "Bootstrap apply initiated."}), 200
+    except Exception as e:
+        update_queue.put(f"Error: {str(e)}\n\n")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
+@bootstrap_bp.route('/bootstrap/destroy', methods=['POST'])
+def bootstrap_destroy_route():
+    os.chdir('/app')
+    try:
+        update_queue.put("Starting bootstrap destroy process...\n\n")
+
+        data = request.get_json()
+
+        if not data:
+            return jsonify({"error": "No data received"}), 400
+
+        github_access_token = data.pop('githubAccessToken', None)
+        github_access_token_for_backend = data.pop('githubAccessTokenForBackend', None)
+
+        if not github_access_token and not github_access_token_for_backend:
+            return jsonify({"error": "GitHub access token is required"}), 400
+
+        with open(TOKEN_FILE_PATH, 'w') as f:
+            f.write(github_access_token)
+        with open(TOKEN_FILE_PATH_BACKEND, 'w') as f:
+            f.write(github_access_token_for_backend)
+
+        os.chmod(TOKEN_FILE_PATH, 0o600)
+        os.chmod(TOKEN_FILE_PATH_BACKEND, 0o600)
+
+        filename = secure_filename("bootstrap_data.json")
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+
+        with open(file_path, 'w') as f:
+            json.dump(data, f, indent=4)
+
+
+        git_org_name = data.get('gitOrgName')
+        bootstrap_repo = data.get('bootstrapRepo')
+
+        if not git_org_name or not bootstrap_repo:
+            return jsonify({"error": "gitOrgName or bootstrapRepo missing in data"}), 400
+        
+        terraform_destroy_bootstrap(update_queue,github_access_token,github_access_token_for_backend,git_org_name,bootstrap_repo)
+
+        return jsonify({"status": "success", "message": "Bootstrap destroy initiated."}), 200
     except Exception as e:
         update_queue.put(f"Error: {str(e)}\n\n")
         return jsonify({"status": "error", "message": str(e)}), 500
